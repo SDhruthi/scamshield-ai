@@ -20,7 +20,8 @@ import streamlit as st
 from google import genai
 from PIL import Image
 
-DEFAULT_MODEL = "gemma-4-31b-it"  # other option: "gemma-4-26b-a4b-it" (editable in the sidebar)
+DEFAULT_MODEL = "gemma-4-26b-a4b-it"  # editable in the sidebar
+FALLBACK_MODELS = ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]  # tried automatically if the first one fails
 
 PROMPT = """You are ScamShield AI, a friendly assistant that helps ordinary people
 spot scams, phishing and fake offers in messages (SMS, email, WhatsApp, social media).
@@ -148,16 +149,25 @@ def analyze(api_key: str, model: str, message: str, image: Image.Image | None) -
     )
     contents = [prompt, image] if image else prompt
 
+    # Try the chosen model first, then the others if Google has a temporary server problem (500/503).
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
     response = None
-    for attempt in range(3):  # retry on temporary server errors (500/503)
-        try:
-            response = client.models.generate_content(model=model, contents=contents)
+    last_exc = None
+    for m in models:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(model=m, contents=contents)
+                break
+            except Exception as exc:
+                last_exc = exc
+                transient = any(code in str(exc) for code in ("500", "503", "UNAVAILABLE", "INTERNAL"))
+                if not transient:
+                    raise
+                time.sleep(1.5)
+        if response is not None:
             break
-        except Exception as exc:
-            transient = any(code in str(exc) for code in ("500", "503", "UNAVAILABLE", "INTERNAL"))
-            if attempt == 2 or not transient:
-                raise
-            time.sleep(1.5 * (attempt + 1))
+    if response is None:
+        raise last_exc
 
     text = (response.text or "").strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)  # models sometimes add ```json fences
@@ -169,6 +179,17 @@ def analyze(api_key: str, model: str, message: str, image: Image.Image | None) -
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return fallback
+
+
+def default_api_key() -> str:
+    """Key from the GEMINI_API_KEY env variable, or from Streamlit secrets when hosted online."""
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        try:
+            key = st.secrets.get("GEMINI_API_KEY", "")
+        except Exception:  # no secrets file locally - that's fine
+            key = ""
+    return key
 
 
 def esc(value) -> str:
@@ -237,9 +258,9 @@ def main() -> None:
         st.header("⚙️ Settings")
         model = st.text_input("Gemma model", value=DEFAULT_MODEL).strip().strip(",").strip()
         api_key = st.text_input("Gemini API key", type="password",
-                                value=os.environ.get("GEMINI_API_KEY", "")).strip()
-        st.caption("Your key stays on your computer. Leave it blank to use the "
-                   "GEMINI_API_KEY environment variable.")
+                                value=default_api_key()).strip()
+        st.caption("Leave the key blank to use the GEMINI_API_KEY environment "
+                   "variable (or the app's saved secret when hosted online).")
 
     st.markdown(
         """
